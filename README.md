@@ -1,2 +1,2 @@
-# FedRDA-Federated-Learning-with-Representation-Decoupling-and-Divergence-Aware-Aggregation
+# FedRDA
 FedRDA: Federated Learning with Representation Decoupling and Divergence-Aware Aggregation
