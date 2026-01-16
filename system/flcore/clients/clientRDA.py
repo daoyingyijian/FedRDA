@@ -23,38 +23,18 @@ class KM(nn.Module):
 class IDM(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
-        self.mu = nn.Sequential(
-            nn.Linear(embed_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, embed_dim)
-        )
-        self.logvar = nn.Sequential(
-            nn.Linear(embed_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, embed_dim),
-            nn.Tanh()
-        )
+        self.mu = nn.Sequential(nn.Linear(embed_dim, 128),
+                                nn.ReLU(),
+                                nn.Linear(128, embed_dim))
 
-    def _loglik_per_sample(self, x, y):
-        mu = self.mu(x)
-        logvar = self.logvar(x)
-        var = logvar.exp() + 1e-6
-        ll = -((mu - y) ** 2) / var - logvar   # [B, D] (常数项省略)
-        return ll.sum(dim=1)                   # [B]
-
-    def upper_bound(self, x, y):
-        ll_pos = self._loglik_per_sample(x, y)
-        perm = torch.randperm(y.size(0), device=y.device)
-        y_neg = y[perm]
-        ll_neg = self._loglik_per_sample(x, y_neg)
-        return (ll_pos - ll_neg).mean()
-
-    def learning_loss(self, x, y):
-        return (-self._loglik_per_sample(x, y)).mean()
-
-    def forward(self, x, y):
-        return self.upper_bound(x, y)
-
+        self.logvar = nn.Sequential(nn.Linear(embed_dim, 128),
+                                    nn.ReLU(),
+                                    nn.Linear(128, embed_dim),
+                                    nn.Tanh())
+    def forward(self, gfe, csfe):
+        mu = self.mu(gfe)
+        logvar = self.logvar(gfe)
+        return -1.0 * (-(mu - csfe)**2 /logvar.exp()-logvar).sum(dim=1).mean(dim=0)
 class clientRDA(Client):
     def __init__(self, args, id, train_samples, test_samples, **kwargs):
         super().__init__(args, id, train_samples, test_samples, **kwargs)
@@ -69,20 +49,17 @@ class clientRDA(Client):
         
         self.KM = KM(input_dim=self.feature_dim).to(self.device)
         self.idm=IDM(embed_dim=self.feature_dim).to(self.device)
-        self.opt_main = torch.optim.SGD(
-            list(self.model.base.parameters()),
+        self.optimizer = torch.optim.SGD(
+            list(self.model.base.parameters()) + list(self.idm.parameters()),
             lr=self.learning_rate
         )
-        self.opt_idm = torch.optim.SGD(
-            list(self.idm.parameters()),
-            lr=self.learning_rate
-        )
-        self.train_samples_by_class = defaultdict(int)
-        trainloader = self.load_train_data()
-        for i, (x, y) in enumerate(trainloader):
-            for i, yy in enumerate(y):
-                y_c = yy.item()
-                self.train_samples_by_class[y_c] += 1
+    def get_intermediate_layer_output(self, data):
+        self.model.eval()
+        with torch.no_grad():
+            rep = self.model.base(data)
+            rep_global = rep-self.KM(rep)  
+            rep_self = self.KM(rep)
+        return rep_global
 
 
     def train(self):
@@ -105,12 +82,8 @@ class clientRDA(Client):
                 if self.train_slow:
                     time.sleep(0.1 * np.abs(np.random.rand()))
                 rep = self.model.base(x)
-                rep_global = rep - self.KM(rep)
+                rep_global = rep-self.KM(rep)  
                 rep_self = self.KM(rep)
-                idm_loss = self.idm.learning_loss(rep_self.detach(), rep_global.detach())
-                self.opt_idm.zero_grad()
-                idm_loss.backward()
-                self.opt_idm.step()
                 output = self.model.head(rep_self)
                 loss = self.loss(output, y)
                 if self.global_protos is not None:
@@ -120,9 +93,10 @@ class clientRDA(Client):
                         if y_c in self.global_protos and self.global_protos[y_c].numel() > 0:
                             proto_new[i, :] = self.global_protos[y_c].data
                     loss += self.loss_mse(proto_new, rep_global) * self.lamda
+                # loss+= self.idm(rep_self, rep_global) *self.gamma*0.1
                 if self.global_protos is not None:
-                    proto_new2 = rep_global
-                    feature_dim = self.global_protos[next(iter(self.global_protos))].shape[0]
+                    proto_new2 =rep_global
+                    feature_dim = self.global_protos[next(iter(self.global_protos))].shape[0] 
                     global_protos_list = []
                     for label in range(self.num_classes):
                         if label in self.global_protos:
@@ -130,7 +104,7 @@ class clientRDA(Client):
                         else:
                             global_protos_list.append(torch.zeros(feature_dim).to(self.device))
                     global_protos_tensor = torch.stack(global_protos_list).to(self.device)
-
+                    #global_protos_tensor = torch.stack([self.global_protos[label] for label in sorted(self.global_protos.keys())]).to(self.device)
                     positive_sim = F.cosine_similarity(proto_new2.unsqueeze(1), global_protos_tensor.unsqueeze(0), dim=2)
                     positive_sim = positive_sim[torch.arange(positive_sim.size(0)), y]
                     negative_sim = positive_sim.unsqueeze(1) - positive_sim.unsqueeze(0)
@@ -139,13 +113,10 @@ class clientRDA(Client):
                     positive_exp = torch.exp(positive_sim / self.tau)
                     negative_exp = torch.exp(negative_sim / self.tau).sum(dim=1)
                     proto_contrastive_loss = -torch.log(positive_exp / (positive_exp + negative_exp))
-                    loss += proto_contrastive_loss.mean() * self.lamda
-                mi_ub = self.idm(rep_self, rep_global)  
-                loss = loss + (self.gamma * mi_ub)   
-                self.opt_main.zero_grad()
+                    loss+= proto_contrastive_loss.mean() * self.lamda
+                self.optimizer.zero_grad()
                 loss.backward()
-                self.opt_main.step()
-
+                self.optimizer.step()
         if self.learning_rate_decay:
             self.learning_rate_scheduler.step()
         self.train_time_cost['num_rounds'] += 1
@@ -208,7 +179,6 @@ class clientRDA(Client):
                 y_true.append(lb)
         y_prob = np.concatenate(y_prob, axis=0)
         y_true = np.concatenate(y_true, axis=0)
-
         auc = metrics.roc_auc_score(y_true, y_prob, average='micro')
         return test_acc, test_num, auc
     def train_metrics(self):
