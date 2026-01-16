@@ -70,7 +70,7 @@ class clientRDA(Client):
         self.KM = KM(input_dim=self.feature_dim).to(self.device)
         self.idm=IDM(embed_dim=self.feature_dim).to(self.device)
         self.opt_main = torch.optim.SGD(
-            list(self.model.base.parameters()) + list(self.model.head.parameters()) + list(self.KM.parameters()),
+            list(self.model.base.parameters()),
             lr=self.learning_rate
         )
         self.opt_idm = torch.optim.SGD(
